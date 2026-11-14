@@ -1,0 +1,10 @@
+{
+  "name": "friday",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pookie's personal voice assistant",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

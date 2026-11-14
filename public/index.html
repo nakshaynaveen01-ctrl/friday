@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0d0c0a" />
+  <title>Friday</title>
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">FRI<span>DAY</span></div>
+    <div class="dots"><span class="dot" id="dot-brain">brain</span><span class="dot" id="dot-voice">voice</span></div>
+  </header>
+  <main id="log">
+    <div class="empty" id="empty">Tap the mic and say<br><b>"Friday, what's up?"</b><br>Or switch <b>Wake</b> on and just say <b>"Hey Friday"</b></div>
+  </main>
+  <footer>
+    <div id="state">Tap to talk</div>
+    <button id="mic" aria-label="Talk to Friday">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="9" y="3" width="6" height="11" rx="3" /><path d="M5 11a7 7 0 0 0 14 0" /><path d="M12 18v3" />
+      </svg>
+    </button>
+    <form class="row" id="form">
+      <button type="button" class="small" id="lang" title="Listening language">EN</button>
+      <button type="button" class="small" id="wake" title="Say Hey Friday to talk without tapping">Wake off</button>
+      <input id="text" placeholder="Or type to Friday…" autocomplete="off" />
+      <button class="small" type="submit">Send</button>
+    </form>
+  </footer>
+  <script src="/app.js"></script>
+</body>
+</html>
