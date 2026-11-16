@@ -613,6 +613,14 @@ const WA_COUNT_FILE = join(ROOT, 'memory', 'whatsapp-count.json');
 const waHistory = new Map(); // sender number -> last few turns
 const waSeen = new Set();    // message ids already handled (Meta can deliver one twice)
 
+// Meta only forwards real messages once the app is subscribed to the WhatsApp account itself.
+if (WA_TOKEN && process.env.WHATSAPP_WABA_ID) {
+  fetch(`${WA_API}/${process.env.WHATSAPP_WABA_ID}/subscribed_apps`, {
+    method: 'POST', headers: { Authorization: `Bearer ${WA_TOKEN}` }, signal: AbortSignal.timeout(20_000),
+  }).then(async (r) => console.log(`[whatsapp] account subscription: ${r.status} ${(await r.text()).slice(0, 200)}`))
+    .catch((e) => console.warn('[whatsapp] account subscription failed:', e.message));
+}
+
 function waSignatureOk(raw, header) {
   if (!WA_SECRET) return false;
   const want = Buffer.from('sha256=' + createHmac('sha256', WA_SECRET).update(raw).digest('hex'));
