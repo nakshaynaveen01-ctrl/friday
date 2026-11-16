@@ -613,6 +613,11 @@ const WA_COUNT_FILE = join(ROOT, 'memory', 'whatsapp-count.json');
 const waHistory = new Map(); // sender number -> last few turns
 const waSeen = new Set();    // message ids already handled (Meta can deliver one twice)
 
+// Render's free tier sleeps after 15 idle minutes; a request to our own public URL counts as traffic.
+if (process.env.RENDER_EXTERNAL_URL) {
+  setInterval(() => fetch(`${process.env.RENDER_EXTERNAL_URL}/privacy.html`).catch(() => {}), 10 * 60 * 1000);
+}
+
 // Meta only forwards real messages once the app is subscribed to the WhatsApp account itself.
 if (WA_TOKEN && process.env.WHATSAPP_WABA_ID) {
   fetch(`${WA_API}/${process.env.WHATSAPP_WABA_ID}/subscribed_apps`, {
