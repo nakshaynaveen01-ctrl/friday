@@ -16,7 +16,7 @@ if (existsSync(join(ROOT, '.env'))) {
 }
 
 const PORT = Number(process.env.PORT_BRIDGE || 4322);
-const FRIDAY_URL = `http://localhost:${process.env.PORT || 4321}`;
+const FRIDAY_URL = process.env.FRIDAY_URL || `http://localhost:${process.env.PORT || 4321}`;
 const FRIDAY_PASSCODE = process.env.FRIDAY_PASSCODE || '';
 // Key OpenClaw sends in Authorization: Bearer <key>
 const BRIDGE_KEY = process.env.OPENCLAW_API_KEY || '';
@@ -28,14 +28,21 @@ function send(res, status, body) {
 }
 
 createServer(async (req, res) => {
+  console.log(`[bridge] ${req.method} ${req.url}`);
   if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization,Content-Type' }); return res.end(); }
 
-  // Health / model list — OpenClaw probes these.
-  if (req.method === 'GET' && req.url === '/v1/models') {
-    return send(res, 200, { object: 'list', data: [{ id: 'friday', object: 'model', owned_by: 'friday' }] });
+  // Health / model list — OpenClaw probes these (with or without /v1 prefix).
+  if (req.method === 'GET' && (req.url === '/v1/models' || req.url === '/models')) {
+    return send(res, 200, { object: 'list', data: [{ id: 'friday', object: 'model', owned_by: 'friday' }, { id: 'friday-brain', object: 'model', owned_by: 'friday' }] });
   }
 
-  if (req.method !== 'POST' || !req.url.startsWith('/v1/chat/completions')) {
+  if (req.method === 'GET' && (req.url.startsWith('/v1/models/') || req.url.startsWith('/models/'))) {
+    const id = req.url.replace(/^\/(v1\/)?models\//, '');
+    return send(res, 200, { id, object: 'model', owned_by: 'friday' });
+  }
+
+  const isChat = req.method === 'POST' && (req.url.startsWith('/v1/chat/completions') || req.url.startsWith('/chat/completions'));
+  if (!isChat) {
     return send(res, 404, { error: 'not found' });
   }
 
@@ -72,3 +79,10 @@ createServer(async (req, res) => {
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   });
 }).listen(PORT, '127.0.0.1', () => console.log(`Friday bridge on http://localhost:${PORT}`));
+
+// Render's free tier sleeps after 15 idle minutes (~50s wake-up); ping to keep it warm.
+if (FRIDAY_URL.startsWith('https://')) {
+  const ping = () => fetch(`${FRIDAY_URL}/api/status`).catch(() => {});
+  ping();
+  setInterval(ping, 10 * 60 * 1000);
+}

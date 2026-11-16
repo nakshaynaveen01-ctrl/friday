@@ -491,6 +491,7 @@ async function redditSearch(query) {
 
 // ---- Send WhatsApp via OpenClaw gateway ----
 async function ocSend(to, message) {
+  if (WA_TOKEN && WA_PHONE_ID) { await waSend(String(to).replace(/\D/g, ''), message); return `WhatsApp sent to ${to}.`; }
   if (!OPENCLAW_GW_TOKEN) { console.log(`[openclaw] no token, would send to ${to}: ${message}`); return 'sent (logged only — set OPENCLAW_GW_TOKEN in .env to actually send)'; }
   // OpenClaw gateway REST: POST /api/v1/agent with channel delivery
   const r = await fetch(`http://127.0.0.1:${OPENCLAW_GW_PORT}/api/v1/agent`, {
