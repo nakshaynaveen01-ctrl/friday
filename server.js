@@ -696,12 +696,17 @@ async function waWebhook(req, res, url) {
   if (req.method !== 'POST') return send(res, 405, { error: 'method not allowed' });
   let raw = '';
   for await (const chunk of req) { raw += chunk; if (raw.length > 500_000) return send(res, 413, { error: 'too large' }); }
-  if (!waSignatureOk(raw, req.headers['x-hub-signature-256'])) return send(res, 401, { error: 'bad signature' });
+  if (!waSignatureOk(raw, req.headers['x-hub-signature-256'])) {
+    console.warn(`[whatsapp] webhook rejected: bad signature (header ${req.headers['x-hub-signature-256'] ? 'present' : 'missing'}, secret ${WA_SECRET ? 'set' : 'missing'}, ${raw.length} bytes)`);
+    return send(res, 401, { error: 'bad signature' });
+  }
   res.writeHead(200); res.end('ok'); // answer Meta at once, reply in the background
   try {
     for (const entry of JSON.parse(raw).entry || []) {
       for (const ch of entry.changes || []) {
-        for (const m of ch.value?.messages || []) waHandle(m).catch((e) => console.error('[whatsapp]', e.message));
+        const msgs = ch.value?.messages || [];
+        console.log(`[whatsapp] webhook ok: field=${ch.field} messages=${msgs.length}`);
+        for (const m of msgs) waHandle(m).catch((e) => console.error('[whatsapp]', e.message));
       }
     }
   } catch (e) { console.error('[whatsapp] bad payload', e.message); }
