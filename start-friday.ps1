@@ -24,14 +24,7 @@ if (-not (Answers 'http://localhost:4321/')) {
   for ($i = 0; $i -lt 10 -and -not (Answers 'http://localhost:4321/'); $i++) { Start-Sleep 2 }
 }
 
-# 3. OpenClaw bridge (WhatsApp → Friday)
-if (-not (Answers 'http://localhost:4322/v1/models')) {
-  Write-Host 'Starting OpenClaw bridge...'
-  Start-Process node -ArgumentList 'openclaw-bridge.js' -WorkingDirectory $dir -WindowStyle Hidden
-  Start-Sleep 2
-}
-
-# 4. The old temporary link is no longer used
+# 3. The old temporary link is no longer used
 Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
 
 $link = 'https://nakshay.tail727f7e.ts.net'
