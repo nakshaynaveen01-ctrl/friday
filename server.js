@@ -7,6 +7,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
 import { join, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildIdeas, parseDo } from './ideas.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 
@@ -634,27 +635,62 @@ function waSignatureOk(raw, header) {
 }
 
 // Stops at the monthly cap so Friday can never run past Meta's free replies.
-async function waCountReply() {
+// waCountReply(false) only checks; waCountReply(true) records one successful send.
+async function waCountReply(record = true) {
   const month = new Date().toISOString().slice(0, 7);
   let c = { month, n: 0 };
   try { const j = JSON.parse(await readFile(WA_COUNT_FILE, 'utf8')); if (j.month === month) c = j; } catch {}
   if (c.n >= WA_MONTHLY_CAP) return false;
+  if (!record) return true;
   c.n += 1;
   await mkdir(dirname(WA_COUNT_FILE), { recursive: true });
   await writeFile(WA_COUNT_FILE, JSON.stringify(c));
   return true;
 }
 
+// Returns true when Meta accepted the message. Only successful sends count toward the monthly cap.
 async function waSend(to, body) {
-  if (!WA_TOKEN || !WA_PHONE_ID) { console.log(`[whatsapp] (not sent, no token yet) to ${to}: ${body}`); return; }
-  if (!(await waCountReply())) { console.warn('[whatsapp] monthly reply cap reached, no reply sent'); return; }
+  if (!WA_TOKEN || !WA_PHONE_ID) { console.log(`[whatsapp] (not sent, no token yet) to ${to}: ${body}`); return false; }
+  if (!(await waCountReply(false))) { console.warn('[whatsapp] monthly reply cap reached, no reply sent'); return false; }
   const r = await fetch(`${WA_API}/${WA_PHONE_ID}/messages`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WA_TOKEN}` },
     body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body: body.slice(0, 3800) } }),
     signal: AbortSignal.timeout(20_000),
   });
-  if (!r.ok) console.warn('[whatsapp] send failed', r.status, (await r.text()).slice(0, 200));
+  if (!r.ok) { console.warn('[whatsapp] send failed', r.status, (await r.text()).slice(0, 200)); return false; }
+  await waCountReply(true);
+  return true;
+}
+
+// Proactive messages (briefing, ideas, reminders) fail outside Meta's 24 h window.
+// Keep them and deliver right after Friday answers the user's next message.
+const waPending = [];
+async function waSendOrHold(to, body) {
+  const ok = await waSend(to, body).catch(() => false);
+  if (!ok) { waPending.push(body); if (waPending.length > 5) waPending.shift(); console.log('[whatsapp] held a proactive message until the next chat'); }
+  return ok;
+}
+
+// ---- Claude ideas digest (free sources + free Gemini, see ideas.js) ----
+let lastIdeas = null; // { picks, at }
+async function makeIdeas() {
+  const out = await buildIdeas({ root: ROOT, gemini: GOOGLE_AI_KEY ? { key: GOOGLE_AI_KEY, model: GOOGLE_AI_MODEL, baseUrl: GOOGLE_AI_URL } : null });
+  if (out) lastIdeas = { picks: out.picks, at: Date.now() };
+  return out;
+}
+// "do 2": park the chosen ideas as a Gmail draft (never sent) so Claude picks them up next session.
+async function saveIdeaTodos(nums) {
+  const chosen = nums.map((n) => lastIdeas.picks[n - 1]).filter(Boolean);
+  if (!chosen.length) return 'Those numbers are not on the last list, Pookie.';
+  const body = chosen.map((p) => `- ${p.idea}\n  ${p.url}`).join('\n');
+  try {
+    await composio('GMAIL_CREATE_EMAIL_DRAFT', { recipient_email: process.env.MY_EMAIL || undefined, subject: `[Friday idea] ${chosen.length} to set up in Claude`, body });
+    return `Saved ${chosen.length} for Claude ✅ (Gmail draft "[Friday idea]"). Open Claude and say "friday ideas".`;
+  } catch (e) {
+    console.error('[ideas] draft failed:', e.message);
+    return `Couldn't save it to Gmail (${e.message.slice(0, 60)}). Tell Claude: ${chosen.map((p) => p.url).join(' ')}`;
+  }
 }
 
 // A WhatsApp voice note: fetch it from Meta, then turn it into text with FreeLLMAPI.
@@ -687,17 +723,28 @@ async function waHandle(msg) {
     try { text = await waTranscribe(msg.audio.id); } catch (e) { console.error('[whatsapp] voice note failed:', e.message); }
     if (!text) { await waSend(from, "I couldn't make out that voice note, Pookie. Can you type it or send it again?"); return; }
   } else { await waSend(from, 'I can read text and voice notes on WhatsApp for now, Pookie.'); return; }
-  const history = waHistory.get(from) || [];
-  history.push({ role: 'user', content: text });
-  try {
-    const { reply } = await chat({ messages: history.slice(-6) });
-    history.push({ role: 'assistant', content: reply });
-    waHistory.set(from, history.slice(-6));
-    await waSend(from, reply);
-  } catch (e) {
-    console.error('[whatsapp] chat failed', e.message);
-    await waSend(from, 'Something broke on my side, Pookie. Try again in a minute.').catch(() => {});
+  // Ideas commands: "ideas" = fresh list now; "do 2" / "do 1,3" = save for Claude (only right after a list).
+  const doNums = parseDo(text);
+  if (/^ideas\??$/i.test(text.trim())) {
+    const out = await makeIdeas().catch((e) => { console.error('[ideas]', e.message); return null; });
+    await waSend(from, out ? out.text : 'No new Claude ideas since the last list, Pookie.');
+  } else if (doNums && lastIdeas && Date.now() - lastIdeas.at < 3 * 86400e3) {
+    await waSend(from, await saveIdeaTodos(doNums));
+  } else {
+    const history = waHistory.get(from) || [];
+    history.push({ role: 'user', content: text });
+    try {
+      const { reply } = await chat({ messages: history.slice(-6) });
+      history.push({ role: 'assistant', content: reply });
+      waHistory.set(from, history.slice(-6));
+      await waSend(from, reply);
+    } catch (e) {
+      console.error('[whatsapp] chat failed', e.message);
+      await waSend(from, 'Something broke on my side, Pookie. Try again in a minute.').catch(() => {});
+    }
   }
+  // The user just wrote, so Meta's 24 h window is open: deliver anything that was held.
+  while (waPending.length) { const held = waPending.shift(); if (!(await waSend(from, held))) { waPending.unshift(held); break; } }
 }
 
 async function waWebhook(req, res, url) {
@@ -745,6 +792,7 @@ createServer(async (req, res) => {
     if (PASSCODE && req.headers['x-friday-passcode'] !== PASSCODE) return send(res, 401, { error: 'passcode needed' });
     if (req.method === 'GET' && req.url === '/api/status') return send(res, 200, await status());
     if (req.method === 'GET' && req.url === '/api/rules') return send(res, 200, await loadRules());
+    if (req.method === 'GET' && req.url === '/api/ideas') { const o = await makeIdeas(); return send(res, 200, o ? { text: o.text } : { text: 'nothing new' }); }
     if (req.method === 'POST' && req.url === '/api/chat') return send(res, 200, await chat(await readJson(req)));
     if (req.method === 'POST' && req.url === '/api/speak') {
       const out = await speak(await readJson(req));
@@ -768,7 +816,8 @@ setInterval(async () => {
       await saveReminders(pending);
       for (const r of due) {
         try {
-          await ocSend(MY_WA_NUMBER, `⏰ Reminder: ${r.message}`);
+          if (WA_TOKEN && WA_PHONE_ID) await waSendOrHold(MY_WA_NUMBER, `⏰ Reminder: ${r.message}`);
+          else await ocSend(MY_WA_NUMBER, `⏰ Reminder: ${r.message}`);
           console.log('[reminder] fired:', r.message);
         } catch (e) { console.error('[reminder] send failed:', e.message); }
       }
@@ -795,7 +844,10 @@ setInterval(async () => {
       if (weather.status === 'fulfilled') parts.push(`🌤️ ${weather.value}`);
       parts.push(`📅 TODAY:\n${cal.status === 'fulfilled' ? cal.value : 'could not read calendar'}`);
       parts.push(`📬 INBOX:\n${mail.status === 'fulfilled' ? mail.value : 'could not read mail'}`);
-      await ocSend(MY_WA_NUMBER, `Good morning Pookie! ☀️\n\n${parts.join('\n\n')}`);
+      const ideas = await makeIdeas().catch((e) => { console.error('[ideas]', e.message); return null; });
+      if (ideas) parts.push(ideas.text);
+      const msg = `Good morning Pookie! ☀️\n\n${parts.join('\n\n')}`;
+      if (WA_TOKEN && WA_PHONE_ID) await waSendOrHold(MY_WA_NUMBER, msg); else await ocSend(MY_WA_NUMBER, msg);
     }
   } catch (e) { console.error('[briefing] failed:', e.message); }
 }, 60_000);
