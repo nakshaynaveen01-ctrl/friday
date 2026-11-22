@@ -43,6 +43,31 @@ async function fromGitHub() {
   return out;
 }
 
+// The same creators whose Instagram reels the user saves mostly post the videos/Shorts on YouTube too.
+// YouTube channel feeds are free and need no key or login.
+const YT_CHANNELS = {
+  'Nick Saraev': 'UCbo-KbSjJDG6JWQ_MTZ_rNA', 'Simon Scrapes': 'UCdCR4-uYOg5ju-IUuDnfnQA',
+  'Mark Kashef': 'UCHkzp52CldSPZqU5T49mOnA', 'ByteGrad': 'UCf6AGqO98eGk11nfazociVQ',
+  'Context Window': 'UCv-QSppaeK3bhJBLm_KheNQ', 'CorgiMind': 'UCZ30wo5bhVhF_BA2X3hkk5g',
+  'Jack Roberts': 'UCavC5NALKXKwzg2Xst2EQNA', 'The Hype Kevin': 'UCaU3h5OqvHWhzWFthCGr3gg',
+};
+async function fromYouTube() {
+  const since = Date.now() - LOOKBACK_H * 3600e3;
+  const feeds = await Promise.allSettled(Object.entries(YT_CHANNELS).map(async ([name, id]) => {
+    const r = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${id}`, { headers: UA, signal: AbortSignal.timeout(15000) });
+    if (!r.ok) throw new Error(`${r.status} ${name}`);
+    const xml = await r.text();
+    return [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)].map(([, e]) => ({
+      src: `YouTube ${name}`,
+      title: (e.match(/<title>([^<]*)<\/title>/) || [])[1]?.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'") || '',
+      url: (e.match(/<link rel="alternate" href="([^"]+)"/) || [])[1] || '',
+      published: Date.parse((e.match(/<published>([^<]+)<\/published>/) || [])[1] || 0),
+      score: Number((e.match(/<media:statistics views="(\d+)"/) || [])[1] || 0) / 100,
+    })).filter((v) => v.url && v.published >= since);
+  }));
+  return feeds.flatMap((f) => (f.status === 'fulfilled' ? f.value : []));
+}
+
 async function loadSeen(root) { try { return new Set(JSON.parse(await readFile(SEEN_FILE(root), 'utf8'))); } catch { return new Set(); } }
 async function saveSeen(root, seen) {
   await mkdir(dirname(SEEN_FILE(root)), { recursive: true });
@@ -69,8 +94,8 @@ Reply with ONLY JSON: [{"i": <number>, "idea": "<one plain-English line, max 16 
 // Returns { text, picks } or null when nothing new.
 export async function buildIdeas({ root, gemini, log = console.log }) {
   // Reddit is left out on purpose: it blocks bots, and getting around that would break the no-bypass rule.
-  const results = await Promise.allSettled([fromHN(), fromGitHub()]);
-  const names = ['HN', 'GitHub'];
+  const results = await Promise.allSettled([fromHN(), fromGitHub(), fromYouTube()]);
+  const names = ['HN', 'GitHub', 'YouTube creators'];
   results.forEach((r, i) => log(`[ideas] ${names[i]}: ${r.status === 'fulfilled' ? `${r.value.length} items` : `failed (${r.reason?.message})`}`));
   const seen = await loadSeen(root);
   const byUrl = new Map();
