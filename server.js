@@ -806,7 +806,7 @@ async function waReply(from, text) {
     } catch (e) {
       console.error('[whatsapp] chat failed', e.message);
       // Not saved to history, so a failed turn is never answered twice later.
-      await waSend(from, 'Something broke on my side, Pookie. Try again in a minute.').catch(() => {});
+      await waSend(from, `Something broke on my side, Pookie. Try again in a minute. (${String(e.message).slice(0, 150)})`).catch(() => {});
       return;
     }
   }
