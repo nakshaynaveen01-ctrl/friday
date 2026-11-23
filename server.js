@@ -8,6 +8,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildIdeas, parseDo } from './ideas.js';
+import { createMemory } from './memory.js';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 
@@ -61,17 +62,12 @@ const MIME = {
   '.svg': 'image/svg+xml', '.png': 'image/png',
 };
 
+// Long-term memory (Supabase when its keys are set, so it survives Render redeploys). See memory.js.
+const mem = createMemory({ root: ROOT });
+console.log(`[memory] ${mem.enabled ? 'Supabase (persistent)' : 'local files + RAM'}`);
+
 async function loadRules() {
-  try { return JSON.parse(await readFile(RULES_FILE, 'utf8')); } catch { return []; }
-}
-
-async function saveRules(rules) {
-  await mkdir(dirname(RULES_FILE), { recursive: true });
-  await writeFile(RULES_FILE, JSON.stringify(rules, null, 2));
-}
-
-async function loadFacts() {
-  try { return JSON.parse(await readFile(FACTS_FILE, 'utf8')); } catch { return []; }
+  return (await mem.listFacts('rule').catch(() => [])).map((r) => ({ rule: r.fact, saved: String(r.created_at || '').slice(0, 10) }));
 }
 
 async function loadReminders() {
@@ -117,13 +113,14 @@ const TOOLS_ON = `- Connected: her Gmail, Google Calendar, web search, weather, 
 - For reminders, convert her words to minutes (e.g. "in 2 hours" → 120).
 - For notes: use [[DO: note]] to save anything she wants to remember long-term.`;
 
-async function systemPrompt() {
+async function systemPrompt({ query = '', summary = '' } = {}) {
   // friday-core.md is the short runtime version of friday-prompt.md (fewer tokens per message).
   const persona = await readFile(join(ROOT, 'friday-core.md'), 'utf8');
   const rules = await loadRules();
   const now = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'full', timeStyle: 'short' });
-  const facts = await loadFacts();
-  const factText = facts.length ? facts.map((f) => `- ${f.fact}`).join('\n') : '(none yet)';
+  // Only the facts that match what she is saying now, so old topics are not dragged back every turn.
+  const facts = await mem.relevantFacts(query).catch(() => []);
+  const factText = facts.length ? facts.map((f) => `- ${f}`).join('\n') : '(nothing that matches this message)';
   const ruleText = rules.length
     ? rules.map((r, i) => `${i + 1}. ${r.rule} (saved ${r.saved})`).join('\n')
     : '(none yet)';
@@ -133,7 +130,15 @@ async function systemPrompt() {
 - Date and time in India: ${now}.
 ${COMPOSIO_KEY ? TOOLS_ON : TOOLS_OFF}
 
-# What you know about Pookie
+# How to use the conversation
+- Answer ONLY her latest message. Earlier messages are context, not questions to answer again.
+- Never repeat something you already said, and never bring an old topic back unless she does.
+- A short reply like "ok", "nice" or "thanks" needs a short reply, not a new command.
+
+# Earlier with Pookie (background summary; mention only if she brings it up)
+${summary || '(nothing yet)'}
+
+# Facts you know about Pookie that may fit this message (use one naturally only if it truly helps)
 ${factText}
 
 # Saved rules from Pookie (newest wins if two conflict)
@@ -220,28 +225,20 @@ async function saveMemories(reply) {
     .replace(/\[\[REMEMBER:\s*(.+?)\]\]/g, (_, rule) => { saved.push(rule.trim()); return ''; })
     .replace(/\[\[FACT:\s*(.+?)\]\]/g, (_, fact) => { facts.push(fact.trim()); return ''; })
     .trim();
-  const today = new Date().toISOString().slice(0, 10);
-  if (saved.length) {
-    const rules = await loadRules();
-    for (const rule of saved) rules.push({ rule, saved: today });
-    await saveRules(rules);
-  }
-  if (facts.length) {
-    const all = await loadFacts();
-    for (const fact of facts) all.push({ fact, saved: today });
-    await mkdir(dirname(FACTS_FILE), { recursive: true });
-    await writeFile(FACTS_FILE, JSON.stringify(all.slice(-60), null, 2));
-  }
+  // Duplicates are skipped by the store, so the same fact is never saved twice.
+  for (const rule of saved) await mem.addFact(rule, 'rule').catch((e) => console.error('[memory] rule', e.message));
+  for (const fact of facts) await mem.addFact(fact, 'fact').catch((e) => console.error('[memory] fact', e.message));
   return { reply, saved: [...saved, ...facts] };
 }
 
 const DO_TAG = /\[\[DO:\s*([\s\S]+?)\]\]/g;
 
-async function chat({ messages = [] }) {
+async function chat({ messages = [], summary = '' }) {
   const history = messages
     .filter((m) => (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
-    .slice(-6);
-  const messagesOut = [{ role: 'system', content: await systemPrompt() }, ...history];
+    .slice(-8);
+  const query = [...history].reverse().find((m) => m.role === 'user')?.content || '';
+  const messagesOut = [{ role: 'system', content: await systemPrompt({ query, summary }) }, ...history];
   let { text, model } = await llm(messagesOut);
 
   // Mail and calendar: run what Friday asked for, then let her answer with the result.
@@ -592,8 +589,6 @@ async function status() {
 
 // ---- WhatsApp: Meta posts your messages here, Friday answers through the Cloud API ----
 const WA_COUNT_FILE = join(ROOT, 'memory', 'whatsapp-count.json');
-const waHistory = new Map(); // sender number -> last few turns
-const waSeen = new Set();    // message ids already handled (Meta can deliver one twice)
 
 // Render's free tier sleeps after 15 idle minutes; a request to our own public URL counts as traffic.
 if (process.env.RENDER_EXTERNAL_URL) {
@@ -620,12 +615,15 @@ function waSignatureOk(raw, header) {
 async function waCountReply(record = true) {
   const month = new Date().toISOString().slice(0, 7);
   let c = { month, n: 0 };
-  try { const j = JSON.parse(await readFile(WA_COUNT_FILE, 'utf8')); if (j.month === month) c = j; } catch {}
+  try {
+    const j = mem.enabled ? await mem.kvGet('wa_count', null) : JSON.parse(await readFile(WA_COUNT_FILE, 'utf8'));
+    if (j?.month === month) c = j;
+  } catch {}
   if (c.n >= WA_MONTHLY_CAP) return false;
   if (!record) return true;
   c.n += 1;
-  await mkdir(dirname(WA_COUNT_FILE), { recursive: true });
-  await writeFile(WA_COUNT_FILE, JSON.stringify(c));
+  if (mem.enabled) await mem.kvSet('wa_count', c).catch(() => {});
+  else { await mkdir(dirname(WA_COUNT_FILE), { recursive: true }); await writeFile(WA_COUNT_FILE, JSON.stringify(c)); }
   return true;
 }
 
@@ -646,11 +644,58 @@ async function waSend(to, body) {
 
 // Proactive messages (briefing, ideas, reminders) fail outside Meta's 24 h window.
 // Keep them and deliver right after Friday answers the user's next message.
-const waPending = [];
-async function waSendOrHold(to, body) {
+// Held messages are saved (so a restart keeps them), expire after 12 h, and only the newest briefing is kept.
+const HOLD_MS = 12 * 3600e3;
+async function waSendOrHold(to, body, kind = 'note') {
   const ok = await waSend(to, body).catch(() => false);
-  if (!ok) { waPending.push(body); if (waPending.length > 5) waPending.shift(); console.log('[whatsapp] held a proactive message until the next chat'); }
+  if (ok) await mem.addMessage(`wa:${to}`, 'assistant', body).catch(() => {});
+  else {
+    let held = (await mem.kvGet('wa_pending', []).catch(() => [])).filter((h) => Date.now() - h.at < HOLD_MS);
+    if (kind === 'briefing') held = held.filter((h) => h.kind !== 'briefing');
+    held.push({ body, kind, at: Date.now() });
+    await mem.kvSet('wa_pending', held.slice(-3)).catch(() => {});
+    console.log('[whatsapp] held a proactive message until the next chat');
+  }
   return ok;
+}
+
+// The user just wrote, so Meta's 24 h window is open: deliver what was held (fresh ones only) and log it.
+async function waFlushHeld(to) {
+  const held = (await mem.kvGet('wa_pending', []).catch(() => [])).filter((h) => Date.now() - h.at < HOLD_MS);
+  await mem.kvSet('wa_pending', []).catch(() => {});
+  for (const h of held) {
+    const body = `(earlier) ${h.body}`;
+    if (await waSend(to, body)) await mem.addMessage(`wa:${to}`, 'assistant', body).catch(() => {});
+  }
+}
+
+// One free Gemini call that folds old turns into a short running summary.
+async function summarizeTurns(oldSummary, turns) {
+  const convo = turns.map((m) => `${m.role === 'user' ? 'Pookie' : 'Friday'}: ${m.content.slice(0, 500)}`).join('\n');
+  const { text } = await llm([
+    { role: 'system', content: 'You keep a short memory of a chat between Pookie and her assistant Friday. Merge the old summary and the new messages into one updated summary of at most 120 words: what she is working on, decisions, open to-dos, and anything she asked to follow up. Drop small talk and anything already finished. Plain sentences, no headings.' },
+    { role: 'user', content: `OLD SUMMARY:\n${oldSummary || '(none)'}\n\nNEW MESSAGES:\n${convo}` },
+  ]);
+  return text.replace(DO_TAG, '').trim();
+}
+
+// "remember X", "forget X", "what do you remember": handled here so they never depend on the model.
+async function memoryCommand(text) {
+  const t = text.trim();
+  let m = t.match(/^(?:friday[, ]+)?(?:pls |please )?remember(?: that)?[:, ]+(.{3,})$/i);
+  if (m) return (await mem.addFact(m[1].replace(/[.!]+$/, ''), 'fact')) ? `Saved 🧠 "${m[1].replace(/[.!]+$/, '')}"` : 'I already had that one saved, Pookie.';
+  m = t.match(/^(?:friday[, ]+)?(?:pls |please )?forget(?: that| about)?[:, ]+(.{2,})$/i);
+  if (m) {
+    const gone = await mem.forget(m[1]);
+    return gone.length ? `Forgot 🗑️\n${gone.map((g) => `- ${g}`).join('\n')}` : "I couldn't find a saved fact like that, Pookie. Say \"what do you remember\" to see the list.";
+  }
+  if (/^(?:friday[, ]+)?what do you (?:remember|know about me)\??$/i.test(t)) {
+    const facts = await mem.listFacts('fact');
+    const rules = await mem.listFacts('rule');
+    if (!facts.length && !rules.length) return 'Nothing saved yet. Say "remember ..." to teach me.';
+    return [facts.length && `🧠 Facts:\n${facts.map((f) => `- ${f.fact}`).join('\n')}`, rules.length && `📏 Rules:\n${rules.map((r) => `- ${r.fact}`).join('\n')}`].filter(Boolean).join('\n\n').slice(0, 3500);
+  }
+  return null;
 }
 
 // ---- Claude ideas digest (free sources + free Gemini, see ideas.js) ----
@@ -716,9 +761,7 @@ async function geminiTranscribe(audio, mimeType) {
 async function waHandle(msg) {
   const from = String(msg.from || '');
   if (!WA_ALLOWED.includes(from)) { console.log('[whatsapp] ignored a message from a number that is not on the allowed list'); return; }
-  if (waSeen.has(msg.id)) return;
-  waSeen.add(msg.id);
-  if (waSeen.size > 500) waSeen.delete(waSeen.values().next().value);
+  if (!(await mem.firstSeen(msg.id))) { console.log('[whatsapp] skipped a message Meta delivered twice'); return; }
   let text = '';
   if (msg.type === 'text') text = String(msg.text?.body || '');
   else if (msg.type === 'audio' && msg.audio?.id) {
@@ -726,27 +769,42 @@ async function waHandle(msg) {
     if (!text) { await waSend(from, "I couldn't make out that voice note, Pookie. Can you type it or send it again?"); return; }
   } else { await waSend(from, 'I can read text and voice notes on WhatsApp for now, Pookie.'); return; }
   // Ideas commands: "ideas" = fresh list now; "do 2" / "do 1,3" = save for Claude (only right after a list).
+  // One message at a time per sender, so two quick texts don't both read and write the same history.
+  const prev = waQueue.get(from) || Promise.resolve();
+  const run = prev.then(() => waReply(from, text)).catch((e) => console.error('[whatsapp]', e.message));
+  waQueue.set(from, run);
+  await run;
+}
+
+const waQueue = new Map();
+async function waReply(from, text) {
+  const channel = `wa:${from}`;
   const doNums = parseDo(text);
-  if (/^ideas\??$/i.test(text.trim())) {
+  let reply = null;
+  const quick = await memoryCommand(text).catch((e) => { console.error('[memory]', e.message); return null; });
+  if (quick) reply = quick;
+  else if (/^ideas\??$/i.test(text.trim())) {
     const out = await makeIdeas().catch((e) => { console.error('[ideas]', e.message); return null; });
-    await waSend(from, out ? out.text : 'No new Claude ideas since the last list, Pookie.');
+    reply = out ? out.text : 'No new Claude ideas since the last list, Pookie.';
   } else if (doNums && lastIdeas && Date.now() - lastIdeas.at < 3 * 86400e3) {
-    await waSend(from, await saveIdeaTodos(doNums));
+    reply = await saveIdeaTodos(doNums);
   } else {
-    const history = waHistory.get(from) || [];
-    history.push({ role: 'user', content: text });
     try {
-      const { reply } = await chat({ messages: history.slice(-6) });
-      history.push({ role: 'assistant', content: reply });
-      waHistory.set(from, history.slice(-6));
-      await waSend(from, reply);
+      const [history, summary] = await Promise.all([mem.recentMessages(channel, 7).catch(() => []), mem.getSummary(channel).catch(() => '')]);
+      ({ reply } = await chat({ messages: [...history, { role: 'user', content: text }], summary }));
     } catch (e) {
       console.error('[whatsapp] chat failed', e.message);
+      // Not saved to history, so a failed turn is never answered twice later.
       await waSend(from, 'Something broke on my side, Pookie. Try again in a minute.').catch(() => {});
+      return;
     }
   }
-  // The user just wrote, so Meta's 24 h window is open: deliver anything that was held.
-  while (waPending.length) { const held = waPending.shift(); if (!(await waSend(from, held))) { waPending.unshift(held); break; } }
+  // Save the pair only once there is a reply.
+  await mem.addMessage(channel, 'user', text).catch((e) => console.error('[memory] save', e.message));
+  await mem.addMessage(channel, 'assistant', reply).catch(() => {});
+  await waSend(from, reply);
+  await waFlushHeld(from);
+  mem.maybeSummarize(channel, summarizeTurns).catch((e) => console.error('[memory] summary', e.message));
 }
 
 async function waWebhook(req, res, url) {
@@ -849,7 +907,7 @@ setInterval(async () => {
       const ideas = await makeIdeas().catch((e) => { console.error('[ideas]', e.message); return null; });
       if (ideas) parts.push(ideas.text);
       const msg = `Good morning Pookie! ☀️\n\n${parts.join('\n\n')}`;
-      if (WA_TOKEN && WA_PHONE_ID) await waSendOrHold(MY_WA_NUMBER, msg); else await ocSend(MY_WA_NUMBER, msg);
+      if (WA_TOKEN && WA_PHONE_ID) await waSendOrHold(MY_WA_NUMBER, msg, 'briefing'); else await ocSend(MY_WA_NUMBER, msg);
     }
   } catch (e) { console.error('[briefing] failed:', e.message); }
 }, 60_000);
