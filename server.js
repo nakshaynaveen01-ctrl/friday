@@ -43,8 +43,6 @@ const REMINDERS_FILE = join(ROOT, 'memory', 'reminders.json');
 // Composio (mail and calendar). The key lives only in .env.
 const COMPOSIO_KEY = process.env.COMPOSIO_KEY || '';
 const COMPOSIO_URL = process.env.COMPOSIO_MCP_URL || 'https://connect.composio.dev/mcp';
-// Claude API (optional — smarter answers)
-const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY || '';
 // OpenClaw gateway (for sending proactive WhatsApp messages)
 const OPENCLAW_GW_PORT = Number(process.env.OPENCLAW_GW_PORT || 18789);
 const OPENCLAW_GW_TOKEN = process.env.OPENCLAW_GW_TOKEN || '';
@@ -185,25 +183,8 @@ async function llm(messagesOut) {
     } catch (e) { console.warn('[llm] google ai failed, falling back:', e.message); }
   }
 
-  // Claude API (optional paid upgrade)
-  if (ANTHROPIC_KEY) {
-    try {
-      const sys = messagesOut.find((m) => m.role === 'system')?.content || '';
-      const msgs = messagesOut.filter((m) => m.role !== 'system');
-      const r = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({ model: 'claude-haiku-5-5', max_tokens: 1024, system: sys, messages: msgs }),
-        signal: AbortSignal.timeout(30_000),
-      });
-      if (r.ok) {
-        const j = await r.json();
-        const text = j.content?.[0]?.text;
-        if (text) return { text, model: 'claude-haiku-5-5' };
-      }
-    } catch (e) { console.warn('[llm] claude failed, falling back:', e.message); }
-  }
-  const models = [...new Set([FREELLM_MODEL, 'claude-haiku-4.5', 'claude-sonnet-4-5', 'gemini-flash-lite', 'auto'])];
+  // Friday must never spend the user's Claude usage: no Anthropic calls and no claude-* model names.
+  const models = [...new Set([FREELLM_MODEL, 'gemini-flash-lite', 'auto'])].filter((m) => !/claude/i.test(m));
   let lastError = '';
   for (const model of models) {
     let r;
@@ -701,14 +682,35 @@ async function waTranscribe(mediaId) {
   const { url, mime_type } = await meta.json();
   const file = await fetch(url, { headers: auth, signal: AbortSignal.timeout(30_000) });
   if (!file.ok) throw new Error(`media download ${file.status}`);
+  const audio = Buffer.from(await file.arrayBuffer());
+  if (GOOGLE_AI_KEY) return geminiTranscribe(audio, (mime_type || 'audio/ogg').split(';')[0]);
   const form = new FormData();
-  form.append('file', new Blob([await file.arrayBuffer()], { type: mime_type || 'audio/ogg' }), 'voice.ogg');
+  form.append('file', new Blob([audio], { type: mime_type || 'audio/ogg' }), 'voice.ogg');
   form.append('model', 'auto');
   const r = await fetch(`${FREELLM_URL}/v1/audio/transcriptions`, {
     method: 'POST', headers: { Authorization: `Bearer ${FREELLM_KEY}` }, body: form, signal: AbortSignal.timeout(45_000),
   });
   if (!r.ok) throw new Error(`transcription ${r.status}`);
   return String((await r.json()).text || '').trim();
+}
+
+// Gemini hears the audio directly, so voice notes work on the cloud copy without FreeLLMAPI.
+async function geminiTranscribe(audio, mimeType) {
+  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/${GOOGLE_AI_MODEL}:generateContent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GOOGLE_AI_KEY },
+    body: JSON.stringify({
+      contents: [{ parts: [
+        { inline_data: { mime_type: mimeType, data: audio.toString('base64') } },
+        { text: 'Transcribe this voice note exactly as spoken, fixing only obvious mishearings. If it is not in English or Hinglish, add a new line "English: " with a natural English translation. Output only the text, nothing else. If there is no speech, output nothing.' },
+      ] }],
+      generationConfig: { temperature: 0 },
+    }),
+    signal: AbortSignal.timeout(45_000),
+  });
+  if (!r.ok) throw new Error(`gemini transcription ${r.status}`);
+  const j = await r.json();
+  return String(j.candidates?.[0]?.content?.parts?.map((p) => p.text || '').join('') || '').trim();
 }
 
 async function waHandle(msg) {
