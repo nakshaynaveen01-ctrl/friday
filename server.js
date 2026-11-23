@@ -184,6 +184,8 @@ async function llm(messagesOut) {
         const j = await r.json();
         const text = j.choices?.[0]?.message?.content;
         if (text) return { text, model: GOOGLE_AI_MODEL };
+      } else {
+        console.warn(`[llm] google ai ${r.status}:`, (await r.text()).slice(0, 300));
       }
     } catch (e) { console.warn('[llm] google ai failed, falling back:', e.message); }
   }
@@ -235,7 +237,8 @@ const DO_TAG = /\[\[DO:\s*([\s\S]+?)\]\]/g;
 
 async function chat({ messages = [], summary = '' }) {
   const history = messages
-    .filter((m) => (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
+    // Empty turns (e.g. a voice note that failed to transcribe) make Gemini reject the whole request.
+    .filter((m) => (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.trim())
     .slice(-8);
   const query = [...history].reverse().find((m) => m.role === 'user')?.content || '';
   const messagesOut = [{ role: 'system', content: await systemPrompt({ query, summary }) }, ...history];
