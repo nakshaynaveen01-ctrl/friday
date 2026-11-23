@@ -30,8 +30,13 @@ export function createMemory({ root }) {
   const readJ = async (f) => { try { return JSON.parse(await readFile(f, 'utf8')); } catch { return []; } };
   const writeJ = async (f, v) => { await mkdir(dirname(f), { recursive: true }); await writeFile(f, JSON.stringify(v, null, 2)); };
 
+  // Facts and rules change only through this process, so keep them in RAM (saves a database trip per reply).
+  const cache = new Map();
   async function listFacts(kind = 'fact') {
-    if (enabled) return db(`friday_facts?kind=eq.${kind}&select=id,fact,created_at&order=id.asc&limit=500`);
+    if (enabled) {
+      if (!cache.has(kind)) cache.set(kind, await db(`friday_facts?kind=eq.${kind}&select=id,fact,created_at&order=id.asc&limit=500`));
+      return cache.get(kind);
+    }
     const rows = await readJ(kind === 'rule' ? RULES_FILE : FACTS_FILE);
     return rows.map((r, i) => ({ id: i, fact: r.fact || r.rule, created_at: r.saved }));
   }
@@ -40,7 +45,7 @@ export function createMemory({ root }) {
   async function addFact(fact, kind = 'fact') {
     fact = String(fact).trim().slice(0, 300);
     if (!fact) return false;
-    if (enabled) { const r = await db('friday_facts', { method: 'POST', body: { fact, kind } }); return !r.conflict; }
+    if (enabled) { cache.delete(kind); const r = await db('friday_facts', { method: 'POST', body: { fact, kind } }); return !r.conflict; }
     const f = kind === 'rule' ? RULES_FILE : FACTS_FILE;
     const rows = await readJ(f);
     if (rows.some((r) => (r.fact || r.rule || '').toLowerCase() === fact.toLowerCase())) return false;
@@ -61,6 +66,7 @@ export function createMemory({ root }) {
     if (enabled) {
       const ids = gone.map((r) => r.id).join(',');
       await db(`friday_facts?id=in.(${ids})`, { method: 'DELETE' });
+      cache.clear();
     } else {
       for (const kind of ['fact', 'rule']) {
         const f = kind === 'rule' ? RULES_FILE : FACTS_FILE;

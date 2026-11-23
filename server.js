@@ -762,6 +762,14 @@ async function waHandle(msg) {
   const from = String(msg.from || '');
   if (!WA_ALLOWED.includes(from)) { console.log('[whatsapp] ignored a message from a number that is not on the allowed list'); return; }
   if (!(await mem.firstSeen(msg.id))) { console.log('[whatsapp] skipped a message Meta delivered twice'); return; }
+  // Blue ticks + "typing…" right away, so she sees Friday is on it (free, not a message).
+  if (WA_TOKEN && WA_PHONE_ID) {
+    fetch(`${WA_API}/${WA_PHONE_ID}/messages`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${WA_TOKEN}` },
+      body: JSON.stringify({ messaging_product: 'whatsapp', status: 'read', message_id: msg.id, typing_indicator: { type: 'text' } }),
+      signal: AbortSignal.timeout(10_000),
+    }).catch(() => {});
+  }
   let text = '';
   if (msg.type === 'text') text = String(msg.text?.body || '');
   else if (msg.type === 'audio' && msg.audio?.id) {
@@ -799,10 +807,10 @@ async function waReply(from, text) {
       return;
     }
   }
-  // Save the pair only once there is a reply.
+  // Reply first (fastest for her), then save the pair: only turns that got a reply enter history.
+  await waSend(from, reply);
   await mem.addMessage(channel, 'user', text).catch((e) => console.error('[memory] save', e.message));
   await mem.addMessage(channel, 'assistant', reply).catch(() => {});
-  await waSend(from, reply);
   await waFlushHeld(from);
   mem.maybeSummarize(channel, summarizeTurns).catch((e) => console.error('[memory] summary', e.message));
 }
