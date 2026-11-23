@@ -107,8 +107,9 @@ const TOOLS_ON = `- Connected: her Gmail, Google Calendar, web search, weather, 
   [[DO: reddit <query>]]                search Reddit posts
   [[DO: note | <title> | <content>]]    save a note to her Google Docs
   [[DO: recall <query>]]                search her saved notes (Google Docs)
-- Emails are never sent straight away: first draft, read it back, and only use
-  [[DO: send]] after she clearly says yes.
+- When she tells you to send an email and gives (or you know) the address, send it straight away with
+  [[DO: sendnow | <to email> | <subject> | <body>]], then say who it went to. If she only says "draft"
+  or the address is unknown, use [[DO: draft ...]] and [[DO: send]] after her yes.
 - Never invent mail, events or search results. If you have not run a command, you do not know.
 - For reminders, convert her words to minutes (e.g. "in 2 hours" → 120).
 - For notes: use [[DO: note]] to save anything she wants to remember long-term.`;
@@ -542,6 +543,14 @@ async function runCommand(cmd, lastUser) {
       const d = pendingDraft; pendingDraft = null;
       await composio('GMAIL_SEND_EMAIL', { recipient_email: d.to, subject: d.subject, body: d.body });
       return `Email SENT to ${d.to} with subject "${d.subject}".`;
+    }
+    case 'sendnow': {
+      // Direct send is allowed only when her own last message asks for mail, so text inside emails can't trigger it.
+      if (!/\b(send|mail|email|e-mail)\b/i.test(lastUser)) return 'NOT sent: she did not ask to send an email. Draft it instead.';
+      const [, to, subject, ...body] = parts;
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to || '') || !subject || !body.length) return 'NOT sent: it needs an email address, a subject and a body. Ask her for what is missing.';
+      await composio('GMAIL_SEND_EMAIL', { recipient_email: to, subject: subject.slice(0, 200), body: body.join(' | ').slice(0, 4000) });
+      return `Email SENT to ${to} with subject "${subject.slice(0, 200)}". Tell her it went.`;
     }
     case 'search': {
       if (!arg) return 'Search needs a query.';
